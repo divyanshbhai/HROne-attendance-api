@@ -14,8 +14,9 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pymongo import MongoClient
+import calendar
 
 load_dotenv()
 
@@ -78,6 +79,12 @@ class PunchOut(BaseModel):
     emp_code: str
     punched_at: Optional[int] = None
 
+class LogUpdateBody(BaseModel):
+    status: Optional[str] = None
+    punch_in: Optional[int] = None
+    punch_out: Optional[int] = None
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
 # --------------------------------------------------------------------------- #
 # Endpoints provided
 # --------------------------------------------------------------------------- #
@@ -166,9 +173,9 @@ def list_attendance(
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   POST  /attendance/punch-out
-#   PATCH /attendance/{emp_code}/{date}
-#   GET   /analytics/employees/{emp_code}/monthly
+#   POST  /attendance/punch-out                     [DONE]
+#   PATCH /attendance/{emp_code}/{date}             [Temporarily done, needs review]
+#   GET   /analytics/employees/{emp_code}/monthly   [DONE]
 #   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
@@ -210,3 +217,296 @@ def punch_out(body: PunchOut):
         }}
     )       
     return lastLog
+
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def update_attendance(emp_code: str, date: str, body: LogUpdateBody):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+        
+    Log = db.attendance_logs.find_one({"emp_code": emp_code, "date": date}, {"_id":0})
+    if Log is None:
+        raise HTTPException(404, "no record found")
+        
+    history_entry = {
+        "at": datetime.now(),
+        "by": body.regularized_by,
+        "reason": body.reason
+    }
+
+    if body.status:
+        if body.status == "ABSENT" or body.status == "LEAVE":
+            if body.punch_in or body.punch_out:
+                raise HTTPException(422, "punch_in and punch_out should be null for ABSENT or LEAVE status")
+
+            history_entry["changes"] = {
+                "status": {
+                    "from": Log["status"],
+                    "to": body.status
+                },
+            }
+            Log["status"] = body.status
+            Log["punch_in"] = None
+            Log["punch_out"] = None
+            Log["work_hours"] = None
+            Log["late_minutes"] = 0
+            Log["overtime_minutes"] = 0
+            Log["half_day"] = False
+            Log["history"].append(history_entry)
+
+
+        elif body.status == "PRESENT" or body.status == "WFH" or body.status == "ON_DUTY":
+            if body.punch_in is None and Log["punch_in"] is None:
+                raise HTTPException(422, "punch_in is required for PRESENT, WFH or ON_DUTY status")
+            punch_in_time = datetime.fromtimestamp(body.punch_in / 1000) if body.punch_in else Log["punch_in"]
+            punch_out_time = datetime.fromtimestamp(body.punch_out / 1000) if body.punch_out else Log["punch_out"]
+            if punch_in_time and punch_out_time:
+                if punch_out_time <= punch_in_time:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="punch_out must be after punch_in"
+                    )
+
+                if punch_out_time - punch_in_time > timedelta(hours=24):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="punch_out must be within 24 hours of punch_in"
+                    )
+            work_hours = compute_work_hours(punch_in_time, punch_out_time) if punch_out_time else None
+            late_minutes = compute_late_minutes(punch_in_time, emp["shift_start"]) if punch_in_time else 0
+            overtime_minutes = compute_overtime(punch_out_time, emp["shift_end"], date) if punch_out_time else 0
+            half_day = True if work_hours and work_hours < 4.50 else False 
+
+            history_entry["changes"] = {
+                "status": {
+                    "from": Log["status"],
+                    "to": body.status
+                },
+                "punch_in": {
+                    "from": Log["punch_in"],
+                    "to": punch_in_time
+                },
+                "punch_out": {
+                    "from": Log["punch_out"],
+                    "to": punch_out_time
+                },
+                "work_hours": {
+                    "from": Log["work_hours"],
+                    "to": work_hours
+                },
+                "late_minutes": {
+                    "from": Log["late_minutes"],
+                    "to": late_minutes
+                },
+                "overtime_minutes": {
+                    "from": Log["overtime_minutes"],
+                    "to": overtime_minutes
+                }
+            }
+            Log["status"] = body.status
+            Log["punch_in"] = punch_in_time
+            Log["punch_out"] = punch_out_time
+            Log["work_hours"] = work_hours
+            Log["late_minutes"] = late_minutes
+            Log["overtime_minutes"] = overtime_minutes
+            Log["half_day"] = half_day
+            Log["history"].append(history_entry)
+
+    elif body.punch_in and body.punch_out:
+        punch_in_time = datetime.fromtimestamp(body.punch_in / 1000)
+        punch_out_time = datetime.fromtimestamp(body.punch_out / 1000)
+        if punch_out_time <= punch_in_time:
+            raise HTTPException(
+                status_code=422,
+                detail="punch_out must be after punch_in"
+            )
+        if punch_out_time - punch_in_time > timedelta(hours=24):
+            raise HTTPException(
+                status_code=422,
+                detail="punch_out must be within 24 hours of punch_in"
+            )
+        work_hours = compute_work_hours(punch_in_time, punch_out_time)
+        late_minutes = compute_late_minutes(punch_in_time, emp["shift_start"])
+        overtime_minutes = compute_overtime(punch_out_time, emp["shift_end"], date)
+        half_day = True if work_hours < 4.50 else False
+        history_entry = {
+            "timestamp": datetime.now(),
+            "changes": {
+                "punch_in": {
+                    "from": Log["punch_in"],
+                    "to": punch_in_time
+                },
+                "punch_out": {
+                    "from": Log["punch_out"],
+                    "to": punch_out_time
+                },
+                "work_hours": {
+                    "from": Log["work_hours"],
+                    "to": work_hours
+                },
+                "late_minutes": {
+                    "from": Log["late_minutes"],
+                    "to": late_minutes
+                },
+                "overtime_minutes": {
+                    "from": Log["overtime_minutes"],
+                    "to": overtime_minutes
+                }
+            }
+        }
+        Log["punch_in"] = punch_in_time
+        Log["punch_out"] = punch_out_time
+        Log["work_hours"] = work_hours
+        Log["late_minutes"] = late_minutes
+        Log["overtime_minutes"] = overtime_minutes
+        Log["half_day"] = half_day
+        Log["history"].append(history_entry)
+    
+    elif body.punch_in:
+        punch_in_time = datetime.fromtimestamp(body.punch_in / 1000)
+        punch_out_time = Log["punch_out"]
+        if Log["punch_out"] is not None and punch_in_time >= punch_out_time:
+            raise HTTPException(
+                status_code=422,
+                detail="punch_in must be before punch_out"
+            )
+        if Log["punch_out"] is not None and punch_in_time < punch_out_time and punch_out_time - punch_in_time > timedelta(hours=24):
+            raise HTTPException(
+                status_code=422,
+                detail="punch_in must be within 24 hours of punch_out"
+            )
+            
+        history_entry = {
+            "timestamp": datetime.now(),
+            "changes": {
+                "punch_in": {
+                    "from": Log["punch_in"],
+                    "to": punch_in_time
+                }
+            }
+        }    
+        Log["punch_in"] = punch_in_time
+        Log["late_minutes"] = compute_late_minutes(punch_in_time, emp["shift_start"])
+        if punch_out_time:
+            Log["work_hours"] = compute_work_hours(punch_in_time, punch_out_time)
+            Log["overtime_minutes"] = compute_overtime(punch_out_time, emp["shift_end"], date)
+            Log["half_day"] = True if Log["work_hours"] < 4.50 else False
+        Log["history"].append(history_entry)
+    
+    elif body.punch_out:
+        punch_out_time = datetime.fromtimestamp(body.punch_out / 1000)
+        punch_in_time = Log["punch_in"]
+        if punch_out_time and punch_out_time <= punch_in_time:
+            raise HTTPException(
+                status_code=422,
+                detail="punch_in must be before punch_out"
+            )
+        if punch_out_time and punch_out_time - punch_in_time > timedelta(hours=24):
+            raise HTTPException(
+                status_code=422,
+                detail="punch_in must be within 24 hours of punch_out"
+            )
+        history_entry = {
+            "timestamp": datetime.now(),
+            "changes": {
+                "punch_out": {
+                    "from": Log["punch_out"],
+                    "to": punch_out_time
+                }
+            }
+        }
+        Log["punch_out"] = punch_out_time
+        if Log["punch_in"]:
+            Log["work_hours"] = compute_work_hours(Log["punch_in"], punch_out_time)
+            Log["overtime_minutes"] = compute_overtime(punch_out_time, emp["shift_end"], date)
+            Log["half_day"] = True if Log["work_hours"] < 4.50 else False
+        Log["history"].append(history_entry)
+
+    
+    res = db.attendance_logs.update_one(
+        {"emp_code": emp_code, "date": date},
+        {"$set": {
+            "status": Log["status"],
+            "punch_in": Log["punch_in"],
+            "punch_out": Log["punch_out"],
+            "work_hours": Log["work_hours"],
+            "late_minutes": Log["late_minutes"],
+            "overtime_minutes": Log["overtime_minutes"],
+            "half_day": Log["half_day"],
+            "history": Log["history"]
+        }}
+    )   
+
+    return Log
+
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def monthly_analytics(emp_code: str, month: str):
+    
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    
+    if month is None or len(month) != 7 or month[4] != '-' or not month[:4].isdigit() or not month[5:].isdigit():
+        raise HTTPException(422, "month must be in YYYY-MM format")
+
+    m_y = month.split('-')
+    if not 1900 <= int(m_y[0]) <= 9999 or not 1 <= int(m_y[1]) <= 12:
+        raise HTTPException(422, "invalid month")
+
+
+    doc = db.attendance_logs.aggregate([
+        {"$match": {
+            "emp_code": emp_code,
+            "date": {"$regex": f"^{month}-"}
+        }},  {"$project": {"_id": 0}}  
+    ])
+    year = int(m_y[0])
+    month_num = int(m_y[1])
+
+    total_days = calendar.monthrange(year, month_num)[1]
+    working_days = 0
+
+    for i in range(1, total_days + 1):
+        day = datetime(year, month_num, i)
+
+        if day.weekday() < 5:
+            working_days += 1
+    present_days = 0
+    leave_days = 0
+    late_count = 0
+    total_late_minutes = 0
+    total_overtime_minutes = 0
+
+    for d in doc:
+        if d["status"] in ["PRESENT", "WFH", "ON_DUTY"]:
+            if d["work_hours"] < 4.5:
+                present_days += 0.5
+            else:
+                present_days += 1
+            if d["late_minutes"] > 0:
+                late_count += 1
+                total_late_minutes += d["late_minutes"]
+
+        elif d["status"] == "LEAVE":
+            leave_days += 1
+
+        total_overtime_minutes += d["overtime_minutes"]
+
+    result = {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": present_days,
+        "leave_days": leave_days,
+        "late_count": late_count,
+        "total_late_minutes": total_late_minutes,
+        "total_overtime_minutes": total_overtime_minutes
+    }
+
+    return result
+
+
