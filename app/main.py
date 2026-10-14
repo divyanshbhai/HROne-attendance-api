@@ -176,8 +176,8 @@ def list_attendance(
 #   POST  /attendance/punch-out                     [DONE]
 #   PATCH /attendance/{emp_code}/{date}             [Temporarily done, needs review]
 #   GET   /analytics/employees/{emp_code}/monthly   [DONE]
-#   GET   /analytics/departments/summary
-#   GET   /analytics/leaderboard/late
+#   GET   /analytics/departments/summary            [DONE]
+#   GET   /analytics/leaderboard/late               [DONE]
 #   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
@@ -510,3 +510,226 @@ def monthly_analytics(emp_code: str, month: str):
     return result
 
 
+
+@app.get("/analytics/departments/summary")
+def department_summary(month: str, department: Optional[str] = None):
+    if month is None or len(month) != 7 or month[4] != '-' or not month[:4].isdigit() or not month[5:].isdigit():
+        raise HTTPException(422, "month must be in YYYY-MM format")
+
+    m_y = month.split('-')
+    if not 1900 <= int(m_y[0]) <= 9999 or not 1 <= int(m_y[1]) <= 12:
+        raise HTTPException(422, "invalid month")
+    
+    response = db.employees.aggregate([
+        {"$match": {
+                "joined_on": {"$lte": f"{month}-31"},
+                **({"department": department} if department else {})
+            }},
+        {"$group": {
+            "_id": "$department",
+            "headcount": {"$sum": 1}
+        }},
+        {"$lookup": {
+            "from": "attendance_logs",
+            "let": {"dept": "$_id"},
+            "pipeline": [
+                {"$match": {
+                    "$expr": {
+                        "$and": [
+                            {"$eq": ["$department", "$$dept"]},
+                            {"$regexMatch": {"input": "$date", "regex": f"^{month}-"}}
+                        ]
+                    }
+                }},
+                {"$group": {
+                    "_id": "$emp_code",
+                    "present_days": {"$sum": {"$cond": [    {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]}, {"$cond": [{"$lt": ["$work_hours", 4.5]}, 0.5, 1]}, 0]}},
+                    "avg_work_hours": {"$avg": "$work_hours"},
+                    "late_count": {"$sum": {"$cond": [{"$gt": ["$late_minutes", 0]}, 1, 0]}},
+                    "total_late_minutes": {"$sum": "$late_minutes"},
+                    "leave_count": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+                    "on_duty_count": {"$sum": {"$cond": [{"$eq": ["$status", "ON_DUTY"]}, 1, 0]}}
+                }},
+                {"$group": {
+                    "_id": None,
+                    "present_days": {"$sum": "$present_days"},
+                    "avg_work_hours": {"$avg": "$avg_work_hours"},
+                    "late_count": {"$sum": "$late_count"},
+                    "total_late_minutes": {"$sum": "$total_late_minutes"},
+                    "leave_count": {"$sum": "$leave_count"},
+                    "on_duty_count": {"$sum": "$on_duty_count"}
+                }}
+            ],
+            "as": "attendance_summary"
+        }},
+        {"$unwind": {"path": "$attendance_summary", "preserveNullAndEmptyArrays": True}},
+        {"$project": {
+            "department": "$_id",
+            "headcount": 1,
+            "present_days": {"$ifNull": ["$attendance_summary.present_days", 0]},
+            "avg_work_hours": {"$ifNull": ["$attendance_summary.avg_work_hours", None]},
+            "late_count": {"$ifNull": ["$attendance_summary.late_count", 0]},
+            "total_late_minutes": {"$ifNull": ["$attendance_summary.total_late_minutes", 0]},
+            "leave_count": {"$ifNull": ["$attendance_summary.leave_count", 0]},
+            "on_duty_count": {"$ifNull": ["$attendance_summary.on_duty_count", 0]}
+        }},
+        {"$sort": {"department": 1}}
+    ])
+    output = list(response)
+
+    result = {
+        "month": month,
+        "items": [output]
+    }
+
+    return result
+
+    
+
+
+@app.get("/analytics/leaderboard/late")
+def leaderboard_late(month: str, limit: int = 10, department: Optional[str] = None):
+    if month is None or len(month) != 7 or month[4] != '-' or not month[:4].isdigit() or not month[5:].isdigit():
+        raise HTTPException(422, "month must be in YYYY-MM format")
+
+    m_y = month.split('-')
+    if not 1900 <= int(m_y[0]) <= 9999 or not 1 <= int(m_y[1]) <= 12:
+        raise HTTPException(422, "invalid month")
+
+    if limit < 1 or limit > 50:
+        raise HTTPException(422, "limit must be between 1 and 50")
+
+    pipeline = [
+        {"$match": {
+            "date": {"$regex": f"^{month}-"},
+            "late_minutes": {"$gt": 0}
+        }},
+        {"$group": {
+            "_id": "$emp_code",
+            "total_late_minutes": {"$sum": "$late_minutes"},
+            "late_count": {"$sum": {"$cond": [{"$gt": ["$late_minutes", 0]}, 1, 0]}}
+        }},
+        {"$lookup": {
+            "from": "employees",
+            "localField": "_id",
+            "foreignField": "emp_code",
+            "as": "employee"
+        }},
+        {"$unwind": "$employee"},
+        {"$project": {
+            "_id": 0,
+            "emp_code": "$_id",
+            "name": "$employee.name",
+            "department": "$employee.department",
+            "total_late_minutes": 1,
+            "late_count": 1
+        }},
+        {"$sort": {
+            "total_late_minutes": -1,
+            "emp_code": 1
+        }}
+    ]
+
+    if department:
+        pipeline.insert(2, {"$match": {"employee.department": department}})
+
+    leaderboard = list(db.attendance_logs.aggregate(pipeline))
+
+    # ranking
+    rank = 1
+    prev_total_late_minutes = None
+    for i, entry in enumerate(leaderboard):
+        if prev_total_late_minutes is None or entry["total_late_minutes"] < prev_total_late_minutes:
+            rank = i + 1
+        entry["rank"] = rank
+        prev_total_late_minutes = entry["total_late_minutes"]
+
+    # Apply limit after ranking
+    leaderboard = [entry for entry in leaderboard if entry["rank"] <= limit]
+    return leaderboard
+
+
+
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(department: str, date_from: str, date_to: str):
+    # Validate date format
+    try:
+        start_date = datetime.strptime(date_from, "%Y-%m-%d").date()
+        end_date = datetime.strptime(date_to, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(422, "Invalid date format. Use YYYY-MM-DD.")
+
+    if end_date < start_date:
+        raise HTTPException(422, "to < from")
+    
+    if (end_date - start_date).days > 92:
+        raise HTTPException(422, "Range cannot exceed 92 days.")
+
+    # Check if department has employees
+    headcount = db.employees.count_documents({"department": department})
+    if headcount == 0:
+        raise HTTPException(404, "No employees found for this department.")
+
+    items = []
+    current_date = start_date
+    while current_date <= end_date:
+        is_working_day = current_date.weekday() < 5  # Monday=0, Sunday=6
+        date_str = current_date.isoformat()
+
+        # Get attendance logs for the current date
+        logs = list(db.attendance_logs.find({"date": date_str, "emp_code": {"$in": [e["emp_code"] for e in db.employees.find({"department": department})]}}, {"_id": 0}))
+
+        present_count = sum(0.5 if log["work_hours"] < 4.5 else 1 for log in logs if log["status"] in ["PRESENT", "WFH", "ON_DUTY"])
+        late_count = sum(1 for log in logs if log["late_minutes"] > 0)
+
+        attendance_rate = round(present_count / headcount, 4) if is_working_day and headcount > 0 else None
+
+        items.append({
+            "date": date_str,
+            "is_working_day": is_working_day,
+            "headcount": headcount,
+            "present_count": present_count,
+            "late_count": late_count,
+            "attendance_rate": attendance_rate,
+            "moving_avg_7d": None  # Placeholder for moving average calculation
+        })
+
+        current_date += timedelta(days=1)
+
+    # Calculate moving average for attendance_rate
+    for i in range(len(items)):
+        rates = [item["attendance_rate"] for item in items[max(0, i-6):i+1] if item["attendance_rate"] is not None]
+        if rates:
+            items[i]["moving_avg_7d"] = round(sum(rates) / len(rates), 4)
+    
+    result = {
+        "department": department,
+        "items": items
+    }
+    return result
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(endpoint: str, emp_code: Optional[str] = None, month: Optional[str] = None, department: Optional[str] = None, limit: Optional[int] = None, date_from: Optional[str] = None, date_to: Optional[str] = None, status: Optional[str] = None, page: Optional[int] = 1, page_size: Optional[int] = 20):
+    if endpoint not in ["attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"]:
+        raise HTTPException(422, "invalid endpoint")
+
+    if endpoint == "attendance_list":
+        if date_from is None or date_to is None:
+            raise HTTPException(422, "date_from and date_to are required for attendance_list")
+        q = {}
+        if emp_code:
+            q["emp_code"] = emp_code
+        if date_from or date_to:
+            q["date"] = {}
+            if date_from:
+                q["date"]["$gte"] = date_from
+            if date_to:
+                q["date"]["$lte"] = date_to
+        if status:
+            q["status"] = status
+        explain = db.attendance_logs.find(q).skip((page-1)*page_size).limit(page_size).explain("executionStats")
+        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": explain}
+    
